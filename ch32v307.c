@@ -26,7 +26,6 @@
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
-#include "system/system.h"
 #include "chardev/char-fe.h"
 
 #define TYPE_CH32V_PFIC "ch32v-pfic"
