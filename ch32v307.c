@@ -316,6 +316,7 @@ struct CH32V307SoCState {
 
     RISCVHartArrayState cpus;
     MemoryRegion flash;
+    MemoryRegion flash_alias;
     MemoryRegion sram;
 };
 
@@ -327,10 +328,14 @@ struct CH32V307State {
 
 enum {
     CH32V307_DEV_FLASH,
+    CH32V307_DEV_FLASH_ALIAS,
     CH32V307_DEV_SRAM,
     CH32V307_DEV_PFIC,
     CH32V307_DEV_USART1
 };
+
+#define FLASH_SIZE_KB 256
+#define SRAM_SIZE_KB 64
 
 //
 // Memory map of the chip..
@@ -339,9 +344,9 @@ enum {
 // https://www.wch-ic.com/downloads/CH32V307DS0_PDF.html
 //
 static const MemMapEntry ch_memmap[] = {
-    [CH32V307_DEV_FLASH] = {0x00000000, 480 * 1024}, // apparently the actual silicon resides at 0x08000000
-                                                     // but 0x0 is also a hardware alias for ARM compat
-    [CH32V307_DEV_SRAM]  = {0x20000000,  64 * 1024},
+    [CH32V307_DEV_FLASH] = {0x08000000, FLASH_SIZE_KB * 1024},       // apparently the actual silicon resides at 0x08000000
+	[CH32V307_DEV_FLASH_ALIAS] = {0x00000000, FLASH_SIZE_KB * 1024}, // but 0x0 is also a hardware alias for ARM compat
+    [CH32V307_DEV_SRAM]  = {0x20000000,  SRAM_SIZE_KB * 1024},
     [CH32V307_DEV_PFIC] = {0xE000E000, 0x1100},
     [CH32V307_DEV_USART1] = {0x40013800, 0x400},
 };
@@ -380,12 +385,19 @@ static void ch32v307_soc_realize(DeviceState *dev, Error **errp)
     s->usart1 = ch32v_usart_create(memmap[CH32V307_DEV_USART1].base, serial_hd(0));
 
     //
-    // Initialize flash, rom like for now
+    // Initialize PHYSICAL flash, rom like for now
     // no self programming (yet)
     //
     
     memory_region_init_rom(&s->flash, OBJECT(dev), "ch32v307.flash", memmap[CH32V307_DEV_FLASH].size, &error_fatal);
     memory_region_add_subregion(sys_mem, memmap[CH32V307_DEV_FLASH].base, &s->flash);
+
+    //
+    // Initialize ALIAS flash address
+    //
+
+    memory_region_init_alias(&s->flash_alias, OBJECT(dev), "ch32v307.flash_alias", &s->flash, 0, memmap[CH32V307_DEV_FLASH_ALIAS].size);
+    memory_region_add_subregion(sys_mem, memmap[CH32V307_DEV_FLASH_ALIAS].base, &s->flash_alias);
 
     //
     // Init SRAM
