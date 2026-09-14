@@ -184,6 +184,132 @@ DeviceState *ch32v_pfic_create(hwaddr addr, qemu_irq cpu_irq)
     return dev;
 }
 
+#define TYPE_CH32V_RCC "ch32v-rcc"
+OBJECT_DECLARE_SIMPLE_TYPE(CH32VRCCState, CH32V_RCC)
+
+#define RCC_CTLR      0x00
+#define RCC_CFGR0     0x04
+#define RCC_INTR      0x08
+#define RCC_APB2PRSTR 0x0C
+#define RCC_APB1PRSTR 0x10
+#define RCC_AHBPCENR  0x14
+#define RCC_APB2PCENR 0x18
+#define RCC_APB1PCENR 0x1C
+#define RCC_RSTSCKR   0x24
+#define RCC_MMIO_SIZE 0x400
+
+#define RCC_CTLR_HSIRDY (1u << 1)
+#define RCC_CTLR_HSERDY (1u << 17)
+#define RCC_CTLR_PLLRDY (1u << 25)
+
+#define RCC_APB2PCENR_USART1EN (1u << 14)
+
+struct CH32VRCCState {
+    SysBusDevice parent_obj;
+
+    MemoryRegion mmio;
+
+    uint32_t ctlr;
+    uint32_t cfgr0;
+    uint32_t apb2pcenr;
+    uint32_t apb1pcenr;
+    uint32_t ahbpcenr;
+};
+
+DeviceState *ch32v_rcc_create(hwaddr addr);
+
+static uint64_t ch32v_rcc_read(void *opaque, hwaddr addr, unsigned size)
+{
+    CH32VRCCState *s = CH32V_RCC(opaque);
+
+    switch (addr) {
+    case RCC_CTLR:
+
+         //
+         // NOT modelling a real oscillator.. Firmware clock wait
+         // should not spin forever
+         //
+         
+        return s->ctlr | RCC_CTLR_HSIRDY | RCC_CTLR_HSERDY | RCC_CTLR_PLLRDY;
+    case RCC_CFGR0:
+        return s->cfgr0;
+    case RCC_APB2PCENR:
+        return s->apb2pcenr;
+    case RCC_APB1PCENR:
+        return s->apb1pcenr;
+    case RCC_AHBPCENR:
+        return s->ahbpcenr;
+    default:
+        qemu_log_mask(LOG_UNIMP, "%s: unimplemented read at 0x%" HWADDR_PRIx "\n", __func__, addr);
+        return 0;
+    }
+}
+
+static void ch32v_rcc_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
+{
+    CH32VRCCState *s = CH32V_RCC(opaque);
+
+    switch (addr) {
+    case RCC_CTLR:
+        s->ctlr = val;
+        return;
+    case RCC_CFGR0:
+        s->cfgr0 = val;
+        return;
+    case RCC_APB2PCENR:
+        s->apb2pcenr = val;
+        return;
+    case RCC_APB1PCENR:
+        s->apb1pcenr = val;
+        return;
+    case RCC_AHBPCENR:
+        s->ahbpcenr = val;
+        return;
+    default:
+        qemu_log_mask(LOG_UNIMP, "%s: unimplemented write at 0x%" HWADDR_PRIx " = 0x%" PRIx64 "\n",__func__, addr, val);
+    }
+}
+
+static const MemoryRegionOps ch32v_rcc_ops = {
+    .read = ch32v_rcc_read,
+    .write = ch32v_rcc_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+};
+
+static void ch32v_rcc_init(Object *obj)
+{
+    CH32VRCCState *s = CH32V_RCC(obj);
+
+    memory_region_init_io(&s->mmio, obj, &ch32v_rcc_ops, s, TYPE_CH32V_RCC,
+                           RCC_MMIO_SIZE);
+    sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->mmio);
+}
+
+static const TypeInfo ch32v_rcc_info = {
+    .name          = TYPE_CH32V_RCC,
+    .parent        = TYPE_SYS_BUS_DEVICE,
+    .instance_size = sizeof(CH32VRCCState),
+    .instance_init = ch32v_rcc_init,
+};
+
+static void ch32v_rcc_register_types(void)
+{
+    type_register_static(&ch32v_rcc_info);
+}
+
+type_init(ch32v_rcc_register_types)
+
+DeviceState *ch32v_rcc_create(hwaddr addr)
+{
+    DeviceState *dev = qdev_new(TYPE_CH32V_RCC);
+
+    sysbus_realize(SYS_BUS_DEVICE(dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, addr);
+
+    return dev;
+}
+
 #define TYPE_CH32V_USART "ch32v-usart"
 OBJECT_DECLARE_SIMPLE_TYPE(CH32VUsartState, CH32V_USART)
 
@@ -203,11 +329,12 @@ struct CH32VUsartState {
 
     MemoryRegion mmio;
     CharFrontend chr;
+    CH32VRCCState *rcc;
 
     uint32_t ctlr1, ctlr2, ctlr3, brr, gpr;
 };
 
-DeviceState *ch32v_usart_create(hwaddr addr, Chardev *chr);
+DeviceState *ch32v_usart_create(hwaddr addr, Chardev *chr, CH32VRCCState *rcc);
 
 static uint64_t ch32v_usart_read(void *opaque, hwaddr addr, unsigned size)
 {
@@ -239,6 +366,14 @@ static void ch32v_usart_write(void *opaque, hwaddr addr, uint64_t val, unsigned 
 
     switch (addr) {
     case USART_DATAR:
+        if (s->rcc && !(s->rcc->apb2pcenr & RCC_APB2PCENR_USART1EN)) {
+            qemu_log_mask(LOG_GUEST_ERROR, "%s: DATAR write while USART1 clock disabled (RCC_APB2PCENR.USART1EN=0)\n",__func__);
+            return;
+        }
+        if (!(s->ctlr1 & (1u << 3))) {//TE bit
+            qemu_log_mask(LOG_GUEST_ERROR, "%s: DATAR write while transmitter disabled (CTLR1.TE=0)\n", __func__);
+            return;
+        }
         ch = (uint8_t)val;
         qemu_chr_fe_write_all(&s->chr, &ch, 1);
         return;
@@ -291,11 +426,12 @@ static void ch32v_usart_register_types(void)
 
 type_init(ch32v_usart_register_types)
 
-DeviceState *ch32v_usart_create(hwaddr addr, Chardev *chr)
+DeviceState *ch32v_usart_create(hwaddr addr, Chardev *chr, CH32VRCCState *rcc)
 {
     DeviceState *dev = qdev_new(TYPE_CH32V_USART);
     CH32VUsartState *s = CH32V_USART(dev);
 
+    s->rcc = rcc;
     qemu_chr_fe_init(&s->chr, chr, &error_abort);
     sysbus_realize(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, addr);
@@ -313,6 +449,7 @@ struct CH32V307SoCState {
     DeviceState parent_obj;
     DeviceState *pfic;
     DeviceState *usart1;
+	DeviceState *rcc;
 
     RISCVHartArrayState cpus;
     MemoryRegion flash;
@@ -331,6 +468,7 @@ enum {
     CH32V307_DEV_FLASH_ALIAS,
     CH32V307_DEV_SRAM,
     CH32V307_DEV_PFIC,
+    CH32V307_DEV_RCC,
     CH32V307_DEV_USART1
 };
 
@@ -348,6 +486,7 @@ static const MemMapEntry ch_memmap[] = {
 	[CH32V307_DEV_FLASH_ALIAS] = {0x00000000, FLASH_SIZE_KB * 1024}, // but 0x0 is also a hardware alias for ARM compat
     [CH32V307_DEV_SRAM]  = {0x20000000,  SRAM_SIZE_KB * 1024},
     [CH32V307_DEV_PFIC] = {0xE000E000, 0x1100},
+    [CH32V307_DEV_RCC] = {0x40021000, 0x400},
     [CH32V307_DEV_USART1] = {0x40013800, 0x400},
 };
 
@@ -378,11 +517,12 @@ static void ch32v307_soc_realize(DeviceState *dev, Error **errp)
 
     //
     // Initialize other peripherals
-    // currently.. USART1 and PFIC
+    // currently.. USART1, RCC and PFIC
     //
 
     s->pfic = ch32v_pfic_create(memmap[CH32V307_DEV_PFIC].base, qdev_get_gpio_in(DEVICE(&s->cpus.harts[0]), IRQ_M_EXT));
-    s->usart1 = ch32v_usart_create(memmap[CH32V307_DEV_USART1].base, serial_hd(0));
+    s->rcc = ch32v_rcc_create(memmap[CH32V307_DEV_RCC].base);
+    s->usart1 = ch32v_usart_create(memmap[CH32V307_DEV_USART1].base, serial_hd(0), CH32V_RCC(s->rcc));
 
     //
     // Initialize PHYSICAL flash, rom like for now
