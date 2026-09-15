@@ -281,8 +281,7 @@ static void ch32v_rcc_init(Object *obj)
 {
     CH32VRCCState *s = CH32V_RCC(obj);
 
-    memory_region_init_io(&s->mmio, obj, &ch32v_rcc_ops, s, TYPE_CH32V_RCC,
-                           RCC_MMIO_SIZE);
+    memory_region_init_io(&s->mmio, obj, &ch32v_rcc_ops, s, TYPE_CH32V_RCC, RCC_MMIO_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->mmio);
 }
 
@@ -310,6 +309,131 @@ DeviceState *ch32v_rcc_create(hwaddr addr)
     return dev;
 }
 
+#define TYPE_CH32V_GPIO "ch32v-gpio"
+OBJECT_DECLARE_SIMPLE_TYPE(CH32VGPIOState, CH32V_GPIO)
+
+#define GPIO_CFGLR 0x00
+#define GPIO_CFGHR 0x04
+#define GPIO_INDR  0x08
+#define GPIO_OUTDR 0x0C
+#define GPIO_BSHR  0x10
+#define GPIO_BCR   0x14
+#define GPIO_LCKR  0x18
+#define GPIO_MMIO_SIZE 0x400
+
+struct CH32VGPIOState {
+    SysBusDevice parent_obj;
+
+    MemoryRegion mmio;
+
+    uint32_t cfglr;
+    uint32_t cfghr;
+    uint32_t outdr;
+    uint32_t lckr;
+};
+
+DeviceState *ch32v_gpio_create(hwaddr addr);
+
+static uint64_t ch32v_gpio_read(void *opaque, hwaddr addr, unsigned size)
+{
+    CH32VGPIOState *s = CH32V_GPIO(opaque);
+
+    switch (addr) {
+    case GPIO_CFGLR:
+        return s->cfglr;
+    case GPIO_CFGHR:
+        return s->cfghr;
+    case GPIO_INDR:
+        return s->outdr;
+    case GPIO_OUTDR:
+        return s->outdr;
+    case GPIO_LCKR:
+        return s->lckr;
+    default:
+        qemu_log_mask(LOG_UNIMP, "%s: unimplemented read at 0x%" HWADDR_PRIx "\n", __func__, addr);
+        return 0;
+    }
+}
+
+static void ch32v_gpio_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
+{
+    CH32VGPIOState *s = CH32V_GPIO(opaque);
+
+    switch (addr) {
+    case GPIO_CFGLR:
+        s->cfglr = val;
+        return;
+    case GPIO_CFGHR:
+        s->cfghr = val;
+        return;
+    case GPIO_OUTDR:
+        s->outdr = val;
+        return;
+    case GPIO_BSHR:
+        s->outdr |= (uint32_t)(val & 0xFFFF);
+        s->outdr &= ~(uint32_t)((val >> 16) & 0xFFFF);
+        return;
+    case GPIO_BCR:
+        s->outdr &= ~(uint32_t)(val & 0xFFFF);
+        return;
+    case GPIO_LCKR:
+        s->lckr = val;
+        return;
+    default:
+        qemu_log_mask(LOG_UNIMP, "%s: unimplemented write at 0x%" HWADDR_PRIx " = 0x%" PRIx64 "\n", __func__, addr, val);
+    }
+}
+
+static bool ch32v_gpio_pin_is_af_pp_output(CH32VGPIOState *s, int pin)
+{
+    uint32_t reg = (pin < 8) ? s->cfglr : s->cfghr;
+    int local = pin % 8;
+    uint32_t nibble = (reg >> (local * 4)) & 0xF;
+    uint32_t cnf = (nibble >> 2) & 0x3;
+    uint32_t mode = nibble & 0x3;
+
+    return (cnf == 0x2) && (mode != 0x0);
+}
+
+static const MemoryRegionOps ch32v_gpio_ops = {
+    .read = ch32v_gpio_read,
+    .write = ch32v_gpio_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+};
+
+static void ch32v_gpio_init(Object *obj)
+{
+    CH32VGPIOState *s = CH32V_GPIO(obj);
+
+    memory_region_init_io(&s->mmio, obj, &ch32v_gpio_ops, s, TYPE_CH32V_GPIO, GPIO_MMIO_SIZE);
+    sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->mmio);
+}
+
+static const TypeInfo ch32v_gpio_info = {
+    .name          = TYPE_CH32V_GPIO,
+    .parent        = TYPE_SYS_BUS_DEVICE,
+    .instance_size = sizeof(CH32VGPIOState),
+    .instance_init = ch32v_gpio_init,
+};
+
+static void ch32v_gpio_register_types(void)
+{
+    type_register_static(&ch32v_gpio_info);
+}
+
+type_init(ch32v_gpio_register_types)
+
+DeviceState *ch32v_gpio_create(hwaddr addr)
+{
+    DeviceState *dev = qdev_new(TYPE_CH32V_GPIO);
+
+    sysbus_realize(SYS_BUS_DEVICE(dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, addr);
+
+    return dev;
+}
+
 #define TYPE_CH32V_USART "ch32v-usart"
 OBJECT_DECLARE_SIMPLE_TYPE(CH32VUsartState, CH32V_USART)
 
@@ -323,6 +447,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(CH32VUsartState, CH32V_USART)
 
 #define USART_STATR_TXE (1u << 7)
 #define USART_STATR_TC  (1u << 6)
+#define USART_STATR_RXNE (1u << 5)
+
+#define CH32V307_USART1_TX_PIN 9
 
 struct CH32VUsartState {
     SysBusDevice parent_obj;
@@ -330,32 +457,46 @@ struct CH32VUsartState {
     MemoryRegion mmio;
     CharFrontend chr;
     CH32VRCCState *rcc;
+    CH32VGPIOState *gpioa;
 
     uint32_t ctlr1, ctlr2, ctlr3, brr, gpr;
+    uint8_t rx_data;
+    bool rx_pending;
 };
 
-DeviceState *ch32v_usart_create(hwaddr addr, Chardev *chr, CH32VRCCState *rcc);
+DeviceState *ch32v_usart_create(hwaddr addr, Chardev *chr, CH32VRCCState *rcc, CH32VGPIOState *gpioa);
 
 static uint64_t ch32v_usart_read(void *opaque, hwaddr addr, unsigned size)
 {
     CH32VUsartState *s = CH32V_USART(opaque);
 
     switch (addr) {
-    case USART_STATR:
-        return USART_STATR_TXE | USART_STATR_TC; // no real timing :(
-    case USART_CTLR1:
-        return s->ctlr1;
-    case USART_CTLR2:
-        return s->ctlr2;
-    case USART_CTLR3:
-        return s->ctlr3;
-    case USART_BRR:
-        return s->brr;
-    case USART_GPR:
-        return s->gpr;
-    default:
-        qemu_log_mask(LOG_UNIMP, "%s: unimplemented read at 0x%" HWADDR_PRIx "\n", __func__, addr);
-        return 0;
+        case USART_STATR: {
+            uint32_t v = USART_STATR_TXE | USART_STATR_TC;
+            if (s->rx_pending) {
+                v |= USART_STATR_RXNE;
+            }
+            return v;
+        }
+        case USART_DATAR:
+            if (s->rx_pending) {
+                s->rx_pending = false;
+                return s->rx_data;
+            }
+            return 0;
+        case USART_CTLR1:
+            return s->ctlr1;
+        case USART_CTLR2:
+            return s->ctlr2;
+        case USART_CTLR3:
+            return s->ctlr3;
+        case USART_BRR:
+            return s->brr;
+        case USART_GPR:
+            return s->gpr;
+        default:
+            qemu_log_mask(LOG_UNIMP, "%s: unimplemented read at 0x%" HWADDR_PRIx "\n", __func__, addr);
+            return 0;
     }
 }
 
@@ -365,35 +506,39 @@ static void ch32v_usart_write(void *opaque, hwaddr addr, uint64_t val, unsigned 
     uint8_t ch;
 
     switch (addr) {
-    case USART_DATAR:
-        if (s->rcc && !(s->rcc->apb2pcenr & RCC_APB2PCENR_USART1EN)) {
-            qemu_log_mask(LOG_GUEST_ERROR, "%s: DATAR write while USART1 clock disabled (RCC_APB2PCENR.USART1EN=0)\n",__func__);
+        case USART_DATAR:
+            if (s->rcc && !(s->rcc->apb2pcenr & RCC_APB2PCENR_USART1EN)) {
+                qemu_log_mask(LOG_GUEST_ERROR, "%s: DATAR write while USART1 clock disabled (RCC_APB2PCENR.USART1EN=0)\n", __func__);
+                return;
+            }
+            if (!(s->ctlr1 & (1u << 3))) {
+                qemu_log_mask(LOG_GUEST_ERROR, "%s: DATAR write while transmitter disabled (CTLR1.TE=0)\n", __func__);
+                return;
+            }
+            if (s->gpioa && !ch32v_gpio_pin_is_af_pp_output(s->gpioa, CH32V307_USART1_TX_PIN)) {
+                qemu_log_mask(LOG_GUEST_ERROR, "%s: DATAR write while PA9 not configured as AF push-pull output (GPIOA_CFGHR)\n", __func__);
+                return;
+            }
+            ch = (uint8_t)val;
+            qemu_chr_fe_write_all(&s->chr, &ch, 1);
             return;
-        }
-        if (!(s->ctlr1 & (1u << 3))) {//TE bit
-            qemu_log_mask(LOG_GUEST_ERROR, "%s: DATAR write while transmitter disabled (CTLR1.TE=0)\n", __func__);
+        case USART_CTLR1:
+            s->ctlr1 = val;
             return;
-        }
-        ch = (uint8_t)val;
-        qemu_chr_fe_write_all(&s->chr, &ch, 1);
-        return;
-    case USART_CTLR1:
-        s->ctlr1 = val;
-        return;
-    case USART_CTLR2:
-        s->ctlr2 = val;
-        return;
-    case USART_CTLR3:
-        s->ctlr3 = val;
-        return;
-    case USART_BRR:
-        s->brr = val;
-        return;
-    case USART_GPR:
-        s->gpr = val;
-        return;
-    default:
-        qemu_log_mask(LOG_UNIMP,"%s: unimplemented write at 0x%" HWADDR_PRIx " = 0x%" PRIx64 "\n",__func__, addr, val);
+        case USART_CTLR2:
+            s->ctlr2 = val;
+            return;
+        case USART_CTLR3:
+            s->ctlr3 = val;
+            return;
+        case USART_BRR:
+            s->brr = val;
+            return;
+        case USART_GPR:
+            s->gpr = val;
+            return;
+        default:
+            qemu_log_mask(LOG_UNIMP,"%s: unimplemented write at 0x%" HWADDR_PRIx " = 0x%" PRIx64 "\n",__func__, addr, val);
     }
 }
 
@@ -424,15 +569,31 @@ static void ch32v_usart_register_types(void)
     type_register_static(&ch32v_usart_info);
 }
 
+static int ch32v_usart_can_receive(void *opaque)
+{
+    CH32VUsartState *s = CH32V_USART(opaque);
+    return s->rx_pending ? 0 : 1; // refuse until read
+}
+
+static void ch32v_usart_receive(void *opaque, const uint8_t *buf, int size)
+{
+    CH32VUsartState *s = CH32V_USART(opaque);
+
+    s->rx_data = buf[0];
+    s->rx_pending = true;
+}
+
 type_init(ch32v_usart_register_types)
 
-DeviceState *ch32v_usart_create(hwaddr addr, Chardev *chr, CH32VRCCState *rcc)
+DeviceState *ch32v_usart_create(hwaddr addr, Chardev *chr, CH32VRCCState *rcc, CH32VGPIOState *gpioa)
 {
     DeviceState *dev = qdev_new(TYPE_CH32V_USART);
     CH32VUsartState *s = CH32V_USART(dev);
 
     s->rcc = rcc;
+    s->gpioa = gpioa;
     qemu_chr_fe_init(&s->chr, chr, &error_abort);
+    qemu_chr_fe_set_handlers(&s->chr, ch32v_usart_can_receive, ch32v_usart_receive, NULL, NULL, s, NULL, true);
     sysbus_realize(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, addr);
 
@@ -450,6 +611,7 @@ struct CH32V307SoCState {
     DeviceState *pfic;
     DeviceState *usart1;
 	DeviceState *rcc;
+    DeviceState *gpioa;
 
     RISCVHartArrayState cpus;
     MemoryRegion flash;
@@ -469,6 +631,7 @@ enum {
     CH32V307_DEV_SRAM,
     CH32V307_DEV_PFIC,
     CH32V307_DEV_RCC,
+    CH32V307_DEV_GPIOA,
     CH32V307_DEV_USART1
 };
 
@@ -487,6 +650,7 @@ static const MemMapEntry ch_memmap[] = {
     [CH32V307_DEV_SRAM]  = {0x20000000,  SRAM_SIZE_KB * 1024},
     [CH32V307_DEV_PFIC] = {0xE000E000, 0x1100},
     [CH32V307_DEV_RCC] = {0x40021000, 0x400},
+    [CH32V307_DEV_GPIOA] = {0x40010800, 0x400},
     [CH32V307_DEV_USART1] = {0x40013800, 0x400},
 };
 
@@ -517,12 +681,13 @@ static void ch32v307_soc_realize(DeviceState *dev, Error **errp)
 
     //
     // Initialize other peripherals
-    // currently.. USART1, RCC and PFIC
+    // currently.. USART1, RCC and PFIC, GPIO
     //
 
     s->pfic = ch32v_pfic_create(memmap[CH32V307_DEV_PFIC].base, qdev_get_gpio_in(DEVICE(&s->cpus.harts[0]), IRQ_M_EXT));
     s->rcc = ch32v_rcc_create(memmap[CH32V307_DEV_RCC].base);
-    s->usart1 = ch32v_usart_create(memmap[CH32V307_DEV_USART1].base, serial_hd(0), CH32V_RCC(s->rcc));
+    s->gpioa = ch32v_gpio_create(memmap[CH32V307_DEV_GPIOA].base);
+    s->usart1 = ch32v_usart_create(memmap[CH32V307_DEV_USART1].base, serial_hd(0), CH32V_RCC(s->rcc), CH32V_GPIO(s->gpioa));
 
     //
     // Initialize PHYSICAL flash, rom like for now
