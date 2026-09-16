@@ -600,6 +600,289 @@ DeviceState *ch32v_usart_create(hwaddr addr, Chardev *chr, CH32VRCCState *rcc, C
     return dev;
 }
 
+#define TYPE_CH32V_FPEC "ch32v-fpec"
+#define TYPE_CH32V_FLASH "ch32v-flash-mem"
+OBJECT_DECLARE_SIMPLE_TYPE(CH32VFlashState, CH32V_FLASH)
+OBJECT_DECLARE_SIMPLE_TYPE(CH32VFPECState, CH32V_FPEC)
+
+static bool ch32v_fpec_program_allowed(CH32VFPECState *f);
+static void ch32v_fpec_mark_eop(CH32VFPECState *f);
+
+#define CH32V_FLASH_PAGE_SIZE 4096
+
+struct CH32VFlashState {
+    SysBusDevice parent_obj;
+
+    MemoryRegion mmio;
+    uint8_t *storage;
+    uint32_t size;
+    CH32VFPECState *fpec;
+};
+
+DeviceState *ch32v_flash_create(hwaddr addr, uint32_t size);
+void ch32v_flash_erase_page(CH32VFlashState *s, uint32_t offset);
+void ch32v_flash_mass_erase(CH32VFlashState *s);
+
+static uint64_t ch32v_flash_read(void *opaque, hwaddr addr, unsigned size)
+{
+    CH32VFlashState *s = CH32V_FLASH(opaque);
+    uint64_t v = 0;
+    unsigned i;
+
+    if (addr + size > s->size) {
+        return 0;
+    }
+    for (i = 0; i < size; i++) {
+        v |= ((uint64_t)s->storage[addr + i]) << (8 * i);
+    }
+    return v;
+}
+
+static void ch32v_flash_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
+{
+    CH32VFlashState *s = CH32V_FLASH(opaque);
+    unsigned i;
+
+    if (addr + size > s->size) {
+        return;
+    }
+
+    if (current_cpu == NULL) {
+
+        //
+        // Bypasses FPEC gate
+        //
+
+        for (i = 0; i < size; i++) {
+            s->storage[addr + i] = (uint8_t)(val >> (8 * i));
+        }
+        return;
+    }
+
+    if (!s->fpec || !ch32v_fpec_program_allowed(s->fpec)) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+            "%s: flash write at 0x%" HWADDR_PRIx " while not unlocked+PG (FPEC_CTLR)\n", __func__, addr);
+        return;
+    }
+
+    for (i = 0; i < size; i++) {
+        s->storage[addr + i] &= (uint8_t)(val >> (8 * i));
+    }
+    ch32v_fpec_mark_eop(s->fpec);
+}
+
+static const MemoryRegionOps ch32v_flash_ops = {
+    .read = ch32v_flash_read,
+    .write = ch32v_flash_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+    .impl = { .min_access_size = 1, .max_access_size = 4 },
+};
+
+void ch32v_flash_erase_page(CH32VFlashState *s, uint32_t offset)
+{
+    uint32_t page_base = offset - (offset % CH32V_FLASH_PAGE_SIZE);
+    uint32_t i;
+
+    if (page_base >= s->size) {
+        return;
+    }
+    for (i = 0; i < CH32V_FLASH_PAGE_SIZE && page_base + i < s->size; i++) {
+        s->storage[page_base + i] = 0xFF;
+    }
+}
+
+void ch32v_flash_mass_erase(CH32VFlashState *s)
+{
+    memset(s->storage, 0xFF, s->size);
+}
+
+static const TypeInfo ch32v_flash_info = {
+    .name          = TYPE_CH32V_FLASH,
+    .parent        = TYPE_SYS_BUS_DEVICE,
+    .instance_size = sizeof(CH32VFlashState),
+};
+
+static void ch32v_flash_register_types(void)
+{
+    type_register_static(&ch32v_flash_info);
+}
+
+type_init(ch32v_flash_register_types)
+
+DeviceState *ch32v_flash_create(hwaddr addr, uint32_t size)
+{
+    DeviceState *dev = qdev_new(TYPE_CH32V_FLASH);
+    CH32VFlashState *s = CH32V_FLASH(dev);
+
+    s->size = size;
+
+    memory_region_init_rom_device(&s->mmio, OBJECT(dev), &ch32v_flash_ops,
+                                   s, TYPE_CH32V_FLASH, size, &error_fatal);
+    sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->mmio);
+
+    s->storage = memory_region_get_ram_ptr(&s->mmio);
+    memset(s->storage, 0xFF, size); //erased flash reads as FF
+
+    sysbus_realize(SYS_BUS_DEVICE(dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, addr);
+
+    return dev;
+}
+
+#define FPEC_KEYR   0x04
+#define FPEC_OBKEYR 0x08
+#define FPEC_STATR  0x0C
+#define FPEC_CTLR   0x10
+#define FPEC_ADDR   0x14
+#define FPEC_OBR    0x1C
+#define FPEC_WPR    0x20
+#define FPEC_MMIO_SIZE 0x30
+
+#define FPEC_KEY1 0x45670123u
+#define FPEC_KEY2 0xCDEF89ABu
+
+#define CTLR_PG   (1u << 0)
+#define CTLR_PER  (1u << 1)
+#define CTLR_MER  (1u << 2)
+#define CTLR_STRT (1u << 6)
+#define CTLR_LOCK (1u << 7)
+
+#define STATR_EOP (1u << 5)
+
+struct CH32VFPECState {
+    SysBusDevice parent_obj;
+
+    MemoryRegion mmio;
+    CH32VFlashState *flash;
+
+    uint32_t ctlr;
+    uint32_t statr;
+    uint32_t addr;
+    bool unlocked;
+    int key_seq; //expect 0 = key1 next, 1 = key2 next
+};
+
+DeviceState *ch32v_fpec_create(hwaddr addr, CH32VFlashState *flash);
+
+static bool ch32v_fpec_program_allowed(CH32VFPECState *f)
+{
+    return f->unlocked && (f->ctlr & CTLR_PG);
+}
+
+static void ch32v_fpec_mark_eop(CH32VFPECState *f)
+{
+    f->statr |= STATR_EOP;
+}
+
+static uint64_t ch32v_fpec_read(void *opaque, hwaddr addr, unsigned size)
+{
+    CH32VFPECState *s = CH32V_FPEC(opaque);
+
+    switch (addr) {
+    case FPEC_STATR:
+        return s->statr; //instant
+    case FPEC_CTLR:
+        return s->unlocked ? (s->ctlr & ~CTLR_LOCK) : (s->ctlr | CTLR_LOCK);
+    case FPEC_ADDR:
+        return s->addr;
+    default:
+        qemu_log_mask(LOG_UNIMP, "%s: unimplemented read at 0x%" HWADDR_PRIx "\n", __func__, addr);
+        return 0;
+    }
+}
+
+static void ch32v_fpec_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
+{
+    CH32VFPECState *s = CH32V_FPEC(opaque);
+
+    switch (addr) {
+    case FPEC_KEYR:
+        if (s->key_seq == 0) {
+            s->key_seq = (val == FPEC_KEY1) ? 1 : 0;
+        } else {
+            if (val == FPEC_KEY2) {
+                s->unlocked = true;
+            }
+            s->key_seq = 0;
+        }
+        return;
+    case FPEC_STATR:
+        if (val & STATR_EOP) {
+            s->statr &= ~STATR_EOP; //write 1 to clear
+        }
+        return;
+    case FPEC_CTLR:
+        if (val & CTLR_LOCK) {
+            s->unlocked = false;
+        }
+        if (!s->unlocked) {
+            qemu_log_mask(LOG_GUEST_ERROR, "%s: CTLR write while locked\n", __func__);
+            return;
+        }
+        s->ctlr = val & ~CTLR_LOCK;
+        if ((val & CTLR_STRT) && (s->ctlr & CTLR_PER)) {
+            ch32v_flash_erase_page(s->flash, s->addr - 0x08000000);
+            s->ctlr &= ~(CTLR_PER | CTLR_STRT);
+            ch32v_fpec_mark_eop(s);
+        } else if ((val & CTLR_STRT) && (s->ctlr & CTLR_MER)) {
+            ch32v_flash_mass_erase(s->flash);
+            s->ctlr &= ~(CTLR_MER | CTLR_STRT);
+            ch32v_fpec_mark_eop(s);
+        }
+        return;
+    case FPEC_ADDR:
+        s->addr = val;
+        return;
+    default:
+        qemu_log_mask(LOG_UNIMP, "%s: unimplemented write at 0x%" HWADDR_PRIx " = 0x%" PRIx64 "\n", __func__, addr, val);
+    }
+}
+
+static const MemoryRegionOps ch32v_fpec_ops = {
+    .read = ch32v_fpec_read,
+    .write = ch32v_fpec_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+};
+
+static void ch32v_fpec_init(Object *obj)
+{
+    CH32VFPECState *s = CH32V_FPEC(obj);
+
+    s->ctlr = CTLR_LOCK;
+    memory_region_init_io(&s->mmio, obj, &ch32v_fpec_ops, s, TYPE_CH32V_FPEC, FPEC_MMIO_SIZE);
+    sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->mmio);
+}
+
+static const TypeInfo ch32v_fpec_info = {
+    .name          = TYPE_CH32V_FPEC,
+    .parent        = TYPE_SYS_BUS_DEVICE,
+    .instance_size = sizeof(CH32VFPECState),
+    .instance_init = ch32v_fpec_init,
+};
+
+static void ch32v_fpec_register_types(void)
+{
+    type_register_static(&ch32v_fpec_info);
+}
+
+type_init(ch32v_fpec_register_types)
+
+DeviceState *ch32v_fpec_create(hwaddr addr, CH32VFlashState *flash)
+{
+    DeviceState *dev = qdev_new(TYPE_CH32V_FPEC);
+    CH32VFPECState *s = CH32V_FPEC(dev);
+
+    s->flash = flash;
+    flash->fpec = s;
+
+    sysbus_realize(SYS_BUS_DEVICE(dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, addr);
+
+    return dev;
+}
+
 #define TYPE_CH32V307_MACHINE MACHINE_TYPE_NAME("ch32v307")
 #define TYPE_CH32V307_SOC "ch32v307-soc"
 
@@ -612,9 +895,10 @@ struct CH32V307SoCState {
     DeviceState *usart1;
 	DeviceState *rcc;
     DeviceState *gpioa;
+    DeviceState *flash;
+    DeviceState *fpec;
 
     RISCVHartArrayState cpus;
-    MemoryRegion flash;
     MemoryRegion flash_alias;
     MemoryRegion sram;
 };
@@ -632,7 +916,8 @@ enum {
     CH32V307_DEV_PFIC,
     CH32V307_DEV_RCC,
     CH32V307_DEV_GPIOA,
-    CH32V307_DEV_USART1
+    CH32V307_DEV_USART1,
+    CH32V307_DEV_FPEC
 };
 
 #define FLASH_SIZE_KB 256
@@ -652,6 +937,7 @@ static const MemMapEntry ch_memmap[] = {
     [CH32V307_DEV_RCC] = {0x40021000, 0x400},
     [CH32V307_DEV_GPIOA] = {0x40010800, 0x400},
     [CH32V307_DEV_USART1] = {0x40013800, 0x400},
+    [CH32V307_DEV_FPEC] = {0x40022000, 0x30},
 };
 
 static void ch32v307_soc_init(Object *obj)
@@ -690,18 +976,14 @@ static void ch32v307_soc_realize(DeviceState *dev, Error **errp)
     s->usart1 = ch32v_usart_create(memmap[CH32V307_DEV_USART1].base, serial_hd(0), CH32V_RCC(s->rcc), CH32V_GPIO(s->gpioa));
 
     //
-    // Initialize PHYSICAL flash, rom like for now
-    // no self programming (yet)
+    // Initialize PHYSICAL flash
     //
     
-    memory_region_init_rom(&s->flash, OBJECT(dev), "ch32v307.flash", memmap[CH32V307_DEV_FLASH].size, &error_fatal);
-    memory_region_add_subregion(sys_mem, memmap[CH32V307_DEV_FLASH].base, &s->flash);
+    s->flash = ch32v_flash_create(memmap[CH32V307_DEV_FLASH].base, memmap[CH32V307_DEV_FLASH].size);
+    s->fpec = ch32v_fpec_create(memmap[CH32V307_DEV_FPEC].base, CH32V_FLASH(s->flash));
 
-    //
-    // Initialize ALIAS flash address
-    //
-
-    memory_region_init_alias(&s->flash_alias, OBJECT(dev), "ch32v307.flash_alias", &s->flash, 0, memmap[CH32V307_DEV_FLASH_ALIAS].size);
+    memory_region_init_alias(&s->flash_alias, OBJECT(dev), "ch32v307.flash_alias", &CH32V_FLASH(s->flash)->mmio, 0,
+                             memmap[CH32V307_DEV_FLASH_ALIAS].size);
     memory_region_add_subregion(sys_mem, memmap[CH32V307_DEV_FLASH_ALIAS].base, &s->flash_alias);
 
     //
