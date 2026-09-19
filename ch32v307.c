@@ -617,11 +617,13 @@ struct CH32VFlashState {
     uint8_t *storage;
     uint32_t size;
     CH32VFPECState *fpec;
+    char *image_path;
 };
 
-DeviceState *ch32v_flash_create(hwaddr addr, uint32_t size);
+DeviceState *ch32v_flash_create(hwaddr addr, uint32_t size, const char *image_path);
 void ch32v_flash_erase_page(CH32VFlashState *s, uint32_t offset);
 void ch32v_flash_mass_erase(CH32VFlashState *s);
+void ch32v_flash_sync_to_file(CH32VFlashState *s);
 
 static uint64_t ch32v_flash_read(void *opaque, hwaddr addr, unsigned size)
 {
@@ -648,14 +650,10 @@ static void ch32v_flash_write(void *opaque, hwaddr addr, uint64_t val, unsigned 
     }
 
     if (current_cpu == NULL) {
-
-        //
-        // Bypasses FPEC gate
-        //
-
         for (i = 0; i < size; i++) {
             s->storage[addr + i] = (uint8_t)(val >> (8 * i));
         }
+        ch32v_flash_sync_to_file(s);
         return;
     }
 
@@ -669,6 +667,37 @@ static void ch32v_flash_write(void *opaque, hwaddr addr, uint64_t val, unsigned 
         s->storage[addr + i] &= (uint8_t)(val >> (8 * i));
     }
     ch32v_fpec_mark_eop(s->fpec);
+    ch32v_flash_sync_to_file(s);
+}
+
+void ch32v_flash_sync_to_file(CH32VFlashState *s)
+{
+    GError *err = NULL;
+
+    if (!s->image_path || s->image_path[0] == '\0') {
+        return;
+    }
+    if (!g_file_set_contents(s->image_path, (const char *)s->storage, s->size, &err)) {
+        qemu_log_mask(LOG_GUEST_ERROR, "ch32v-flash: failed to save image '%s': %s\n",s->image_path, err->message);
+        g_error_free(err);
+    }
+}
+
+static void ch32v_flash_load_from_file(CH32VFlashState *s)
+{
+    gchar *contents = NULL;
+    gsize len = 0;
+    GError *err = NULL;
+
+    if (!s->image_path || s->image_path[0] == '\0') {
+        return;
+    }
+    if (!g_file_get_contents(s->image_path, &contents, &len, &err)) {
+        g_error_free(err);
+        return;
+    }
+    memcpy(s->storage, contents, MIN((uint32_t)len, s->size));
+    g_free(contents);
 }
 
 static const MemoryRegionOps ch32v_flash_ops = {
@@ -690,11 +719,13 @@ void ch32v_flash_erase_page(CH32VFlashState *s, uint32_t offset)
     for (i = 0; i < CH32V_FLASH_PAGE_SIZE && page_base + i < s->size; i++) {
         s->storage[page_base + i] = 0xFF;
     }
+    ch32v_flash_sync_to_file(s);
 }
 
 void ch32v_flash_mass_erase(CH32VFlashState *s)
 {
     memset(s->storage, 0xFF, s->size);
+    ch32v_flash_sync_to_file(s);
 }
 
 static const TypeInfo ch32v_flash_info = {
@@ -710,19 +741,21 @@ static void ch32v_flash_register_types(void)
 
 type_init(ch32v_flash_register_types)
 
-DeviceState *ch32v_flash_create(hwaddr addr, uint32_t size)
+DeviceState *ch32v_flash_create(hwaddr addr, uint32_t size, const char *image_path)
 {
     DeviceState *dev = qdev_new(TYPE_CH32V_FLASH);
     CH32VFlashState *s = CH32V_FLASH(dev);
 
     s->size = size;
+    s->image_path = image_path ? g_strdup(image_path) : NULL;
 
     memory_region_init_rom_device(&s->mmio, OBJECT(dev), &ch32v_flash_ops,
                                    s, TYPE_CH32V_FLASH, size, &error_fatal);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->mmio);
 
     s->storage = memory_region_get_ram_ptr(&s->mmio);
-    memset(s->storage, 0xFF, size); //erased flash reads as FF
+    memset(s->storage, 0xFF, size);
+    ch32v_flash_load_from_file(s);
 
     sysbus_realize(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, addr);
@@ -907,6 +940,7 @@ struct CH32V307State {
     MachineState parent_obj;
 
     CH32V307SoCState soc;
+    char *flash_image;
 };
 
 enum {
@@ -979,7 +1013,7 @@ static void ch32v307_soc_realize(DeviceState *dev, Error **errp)
     // Initialize PHYSICAL flash
     //
     
-    s->flash = ch32v_flash_create(memmap[CH32V307_DEV_FLASH].base, memmap[CH32V307_DEV_FLASH].size);
+    s->flash = ch32v_flash_create(memmap[CH32V307_DEV_FLASH].base, memmap[CH32V307_DEV_FLASH].size, CH32V307_MACHINE(qdev_get_machine())->flash_image);
     s->fpec = ch32v_fpec_create(memmap[CH32V307_DEV_FPEC].base, CH32V_FLASH(s->flash));
 
     memory_region_init_alias(&s->flash_alias, OBJECT(dev), "ch32v307.flash_alias", &CH32V_FLASH(s->flash)->mmio, 0,
@@ -1009,6 +1043,19 @@ static const TypeInfo ch32v307_soc_type_info = {
     .instance_init = ch32v307_soc_init,
     .class_init    = ch32v307_soc_class_init,
 };
+
+static char *ch32v307_get_flash_image(Object *obj, Error **errp)
+{
+    CH32V307State *s = CH32V307_MACHINE(obj);
+    return g_strdup(s->flash_image ? s->flash_image : "");
+}
+
+static void ch32v307_set_flash_image(Object *obj, const char *value, Error **errp)
+{
+    CH32V307State *s = CH32V307_MACHINE(obj);
+    g_free(s->flash_image);
+    s->flash_image = g_strdup(value);
+}
 
 static void ch32v307_machine_instance_init(Object *obj)
 {
@@ -1042,6 +1089,9 @@ static void ch32v307_machine_class_init(ObjectClass *oc, const void *data)
     mc->desc = "WCH CH32V307 RISC-V Microcontroller";
     mc->init = ch32v307_machine_init;
     mc->default_cpu_type = RISCV_CPU_TYPE_NAME("rv32");
+
+    object_class_property_add_str(oc, "flash-image", ch32v307_get_flash_image, ch32v307_set_flash_image);
+    object_class_property_set_description(oc, "flash-image", "Path to a file used to persist flash contents across runs");
 }
 
 static const TypeInfo ch32v307_machine_type = {
